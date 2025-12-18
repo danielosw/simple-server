@@ -1,72 +1,68 @@
-#![deny(warnings)]
-#![allow(unused_imports)]
-
+use bytes::Bytes;
 use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::server::conn::http2;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
-// An async function that consumes a request, does nothing with it and returns a
-// response.
-async fn hello(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(Response::new(Full::new(Bytes::from("Hello, World!"))))
+use hyper::{Request, Response, server::conn::http1, service::service_fn};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use std::{convert::Infallible, net::SocketAddr};
+use tokio::{
+    fs::File,
+    io::{self, AsyncReadExt, BufReader},
+    net::TcpListener,
+};
+async fn get_file(path_str: String) -> io::Result<String> {
+    let file = File::open(path_str).await?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = String::new();
+    let _ = reader.read_to_string(&mut buffer).await;
+    Ok(buffer)
 }
-
-#[derive(Clone)]
-// An Executor that uses the tokio runtime.
-pub struct TokioExecutor;
-// Implement the `hyper::rt::Executor` trait for `TokioExecutor` so that it can be used to spawn
-// tasks in the hyper runtime.
-// An Executor allows us to manage execution of tasks which can help us improve the efficiency and
-// scalability of the server.
-impl<F> hyper::rt::Executor<F> for TokioExecutor
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    fn execute(&self, fut: F) {
-        tokio::task::spawn(fut);
-    }
+async fn respond(
+    request: Request<impl hyper::body::Body>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    Ok(Response::new(Full::new(
+        get_file(request.uri().port().unwrap().to_string())
+            .await
+            .unwrap()
+            .into_bytes()
+            .into(),
+    )))
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pretty_env_logger::init();
+
     // This address is localhost
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3999));
+    let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
 
     // Bind to the port and listen for incoming TCP connections
     let listener = TcpListener::bind(addr).await?;
-    println!("Go to 127.0.0.1:3999 to test");
-
+    println!("Listening on http://{}", addr);
     loop {
         // When an incoming TCP connection is received grab a TCP stream for
-        // client-server communication.
+        // client<->server communication.
         //
         // Note, this is a .await point, this loop will loop forever but is not a busy loop. The
         // .await point allows the Tokio runtime to pull the task off of the thread until the task
         // has work to do. In this case, a connection arrives on the port we are listening on and
         // the task is woken up, at which point the task is then put back on a thread, and is
         // driven forward by the runtime, eventually yielding a TCP stream.
-        let (stream, _) = listener.accept().await?;
+        let (tcp, _) = listener.accept().await?;
         // Use an adapter to access something implementing `tokio::io` traits as if they implement
         // `hyper::rt` IO traits.
-        let io = TokioIo::new(stream);
+        let io = TokioIo::new(tcp);
 
         // Spin up a new task in Tokio so we can continue to listen for new TCP connection on the
-        // current task without waiting for the processing of the HTTP/2 connection we just received
+        // current task without waiting for the processing of the HTTP1 connection we just received
         // to finish
         tokio::task::spawn(async move {
-            // Handle the connection from the client using HTTP/2 with an executor and pass any
+            // Handle the connection from the client using HTTP1 and pass any
             // HTTP requests received on that connection to the `hello` function
-            if let Err(err) = http2::Builder::new(TokioExecutor)
-                .serve_connection(io, service_fn(hello))
+            if let Err(err) = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .serve_connection(io, service_fn(respond))
                 .await
             {
-                eprintln!("Error serving connection: {}", err);
+                println!("Error serving connection: {:?}", err);
             }
         });
     }
