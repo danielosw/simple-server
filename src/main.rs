@@ -18,6 +18,10 @@ struct Args {
     serve_path: String,
 }
 async fn get_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    if (path.extension().is_none()) {
+        let lol = fs::read(Path::new(&(path.to_str().unwrap().to_string() + ".html"))).await;
+        return lol;
+    }
     fs::read(path).await
 }
 async fn error_text(main_text: String, err: &str) -> String {
@@ -100,9 +104,9 @@ async fn respond(
 
     // Handle file reading with proper error handling
 
-    println!("{}", requested_path);
     let temp = args.serve_path + "/" + requested_path;
     let getpath = Path::new(&temp);
+    println!("{}", getpath.to_str().unwrap());
     match get_file_bytes(getpath).await {
         Ok(content) => {
             let mut resp = Response::new(Full::new(Bytes::from(content)));
@@ -113,7 +117,7 @@ async fn respond(
                 .map(|s| s.to_lowercase())
             {
                 Some(ext) => match ext.as_str() {
-                    "html" | "htm" => "text/html; charset=utf-8",
+                    "html" | "htm" | "" => "text/html; charset=utf-8",
                     "css" => "text/css; charset=utf-8",
                     "js" => "text/javascript; charset=utf-8",
                     "mjs" => "text/javascript; charset=utf-8",
@@ -129,7 +133,7 @@ async fn respond(
                     "map" => "application/json; charset=utf-8",
                     _ => "application/octet-stream",
                 },
-                None => "application/octet-stream",
+                None => "text/html; charset=utf-8",
             };
             let _ = resp.headers_mut().try_append(
                 header::CONTENT_TYPE,
