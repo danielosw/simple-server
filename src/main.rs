@@ -5,8 +5,8 @@ use hyper::{Request, Response, StatusCode, header, server::conn::http1, service:
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{convert::Infallible, net::SocketAddr, path::Path, result::Result};
 use tokio::{
-    fs::{self, File},
-    io::{self, AsyncReadExt, BufReader},
+    fs::{self},
+    io::{self},
     net::TcpListener,
 };
 
@@ -18,7 +18,7 @@ struct Args {
     serve_path: String,
 }
 async fn get_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    if (path.extension().is_none()) {
+    if path.extension().is_none() {
         let lol = fs::read(Path::new(&(path.to_str().unwrap().to_string() + ".html"))).await;
         return lol;
     }
