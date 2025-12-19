@@ -1,30 +1,132 @@
 use bytes::Bytes;
+use clap::Parser;
 use http_body_util::Full;
-use hyper::{Request, Response, server::conn::http1, service::service_fn};
+use hyper::{Request, Response, StatusCode, header, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use std::{convert::Infallible, net::SocketAddr};
+use std::{convert::Infallible, net::SocketAddr, path::Path, result::Result};
 use tokio::{
     fs::File,
     io::{self, AsyncReadExt, BufReader},
     net::TcpListener,
 };
-async fn get_file(path_str: String) -> io::Result<String> {
-    let file = File::open(path_str).await?;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// local path to serve
+    #[arg(short, long,default_value_t = {"./".to_string()})]
+    serve_path: String,
+}
+async fn get_file(path: &Path) -> io::Result<String> {
+    let file = File::open(path).await?;
     let mut reader = BufReader::new(file);
     let mut buffer = String::new();
-    let _ = reader.read_to_string(&mut buffer).await;
+    reader.read_to_string(&mut buffer).await?;
     Ok(buffer)
+}
+async fn error_text(main_text: String, err: &str) -> String {
+    // if we are running in dev include the actual error
+    #[cfg(debug_assertions)]
+    let result = main_text + ": " + err;
+    // otherwise don't
+    #[cfg(not(debug_assertions))]
+    let result = main_text;
+    result
 }
 async fn respond(
     request: Request<impl hyper::body::Body>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(Response::new(Full::new(
-        get_file(request.uri().port().unwrap().to_string())
-            .await
-            .unwrap()
-            .into_bytes()
-            .into(),
-    )))
+    let args = Args::parse();
+    let mut requested_path = request.uri().path().trim_start_matches('/');
+    // Handle empty path (default to index.html)
+    if requested_path.is_empty() {
+        requested_path = "index.html";
+    }
+
+    // Validate path to prevent directory traversal attacks
+    let p = requested_path;
+    let path = Path::new(p);
+
+    let step_dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+
+        Err(e) => {
+            // If we can't determine the current directory, fail safely
+            let error = error_text("Internal server error".to_string(), &e.to_string()).await;
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap());
+        }
+    };
+    let base_dir = step_dir.join(args.serve_path.clone());
+
+    println!("{}", base_dir.join(path).to_str().unwrap());
+    // Canonicalize the base directory to handle symlinks and relative paths
+    let canonical_base_dir = match base_dir.canonicalize() {
+        Ok(dir) => dir,
+
+        Err(e) => {
+            let error = error_text("Internal server error".to_string(), &e.to_string()).await;
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap());
+        }
+    };
+
+    match canonical_base_dir.join(path).canonicalize() {
+        Ok(canonical_path) => {
+            // Ensure the canonical path is within the canonical base directory
+            if !canonical_path.starts_with(&canonical_base_dir) {
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Full::new(Bytes::from("Access denied")))
+                    .unwrap());
+            }
+        }
+
+        Err(e) => {
+            // Canonicalization can fail for various reasons (file not found, permission issues, etc.)
+            // give generic message for security
+            let error = error_text("Accessed denied".to_string(), &e.to_string()).await;
+            eprintln!("{}", error);
+            eprint!(
+                "Trying to access: {}",
+                canonical_base_dir.join(path).to_str().unwrap()
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap());
+        }
+    }
+
+    // Handle file reading with proper error handling
+
+    println!("{}", requested_path);
+    let temp = args.serve_path + "/" + requested_path;
+    let getpath = Path::new(&temp);
+    match get_file(getpath).await {
+        Ok(content) if getpath.extension().unwrap() == "js" => {
+            let mut resp = Ok(Response::new(Full::new(content.into_bytes().into())));
+            let _ = resp.as_mut().unwrap().headers_mut().try_append(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_str("text/javascript").unwrap(),
+            );
+            resp
+        }
+        Ok(content) => Ok(Response::new(Full::new(content.into_bytes().into()))),
+
+        Err(e) => {
+            eprintln!("{}", e);
+            let error = error_text("File not found".to_string(), &e.to_string()).await;
+            Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap())
+        }
+    }
 }
 
 #[tokio::main]
