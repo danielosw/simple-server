@@ -5,7 +5,7 @@ use hyper::{Request, Response, StatusCode, header, server::conn::http1, service:
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{convert::Infallible, net::SocketAddr, path::Path, result::Result};
 use tokio::{
-    fs::File,
+    fs::{self, File},
     io::{self, AsyncReadExt, BufReader},
     net::TcpListener,
 };
@@ -17,12 +17,8 @@ struct Args {
     #[arg(short, long,default_value_t = {"./".to_string()})]
     serve_path: String,
 }
-async fn get_file(path: &Path) -> io::Result<String> {
-    let file = File::open(path).await?;
-    let mut reader = BufReader::new(file);
-    let mut buffer = String::new();
-    reader.read_to_string(&mut buffer).await?;
-    Ok(buffer)
+async fn get_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    fs::read(path).await
 }
 async fn error_text(main_text: String, err: &str) -> String {
     // if we are running in dev include the actual error
@@ -107,17 +103,40 @@ async fn respond(
     println!("{}", requested_path);
     let temp = args.serve_path + "/" + requested_path;
     let getpath = Path::new(&temp);
-    match get_file(getpath).await {
-        Ok(content) if getpath.extension().unwrap() == "js" => {
-            let mut resp = Ok(Response::new(Full::new(content.into_bytes().into())));
-            let _ = resp.as_mut().unwrap().headers_mut().try_append(
+    match get_file_bytes(getpath).await {
+        Ok(content) => {
+            let mut resp = Response::new(Full::new(Bytes::from(content)));
+            // Set Content-Type based on file extension
+            let mime = match getpath
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase())
+            {
+                Some(ext) => match ext.as_str() {
+                    "html" | "htm" => "text/html; charset=utf-8",
+                    "css" => "text/css; charset=utf-8",
+                    "js" => "text/javascript; charset=utf-8",
+                    "mjs" => "text/javascript; charset=utf-8",
+                    "json" => "application/json; charset=utf-8",
+                    "svg" => "image/svg+xml",
+                    "png" => "image/png",
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "ico" => "image/x-icon",
+                    "txt" | "log" => "text/plain; charset=utf-8",
+                    "wasm" => "application/wasm",
+                    "map" => "application/json; charset=utf-8",
+                    _ => "application/octet-stream",
+                },
+                None => "application/octet-stream",
+            };
+            let _ = resp.headers_mut().try_append(
                 header::CONTENT_TYPE,
-                header::HeaderValue::from_str("text/javascript").unwrap(),
+                header::HeaderValue::from_str(mime).unwrap(),
             );
-            resp
+            Ok(resp)
         }
-        Ok(content) => Ok(Response::new(Full::new(content.into_bytes().into()))),
-
         Err(e) => {
             eprintln!("{}", e);
             let error = error_text("File not found".to_string(), &e.to_string()).await;
