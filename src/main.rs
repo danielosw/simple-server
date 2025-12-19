@@ -61,7 +61,6 @@ async fn respond(
     };
     let base_dir = step_dir.join(args.serve_path.clone());
 
-    println!("{}", base_dir.join(path).to_str().unwrap());
     // Canonicalize the base directory to handle symlinks and relative paths
     let canonical_base_dir = match base_dir.canonicalize() {
         Ok(dir) => dir,
@@ -91,10 +90,6 @@ async fn respond(
             // give generic message for security
             let error = error_text("Accessed denied".to_string(), &e.to_string()).await;
             eprintln!("{}", error);
-            eprint!(
-                "Trying to access: {}",
-                canonical_base_dir.join(path).to_str().unwrap()
-            );
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(error)))
@@ -106,7 +101,6 @@ async fn respond(
 
     let temp = args.serve_path + "/" + requested_path;
     let getpath = Path::new(&temp);
-    println!("{}", getpath.to_str().unwrap());
     match get_file_bytes(getpath).await {
         Ok(content) => {
             let mut resp = Response::new(Full::new(Bytes::from(content)));
