@@ -3,13 +3,23 @@ use clap::Parser;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, header, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use std::{convert::Infallible, net::SocketAddr, path::Path, result::Result};
+use log::LevelFilter;
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    result::Result,
+};
 use tokio::{
     fs::{self},
     io::{self},
     net::TcpListener,
 };
-
+// setup logger
+extern crate pretty_env_logger;
+#[macro_use]
+extern crate log;
+// clap
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -18,20 +28,36 @@ struct Args {
     serve_path: String,
 }
 async fn get_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    if path.extension().is_none() {
-        let lol = fs::read(Path::new(&(path.to_str().unwrap().to_string() + ".html"))).await;
-        return lol;
-    }
     fs::read(path).await
+}
+async fn files_search(path: PathBuf) -> Result<PathBuf, io::Error> {
+    let realpath = path;
+    if realpath.exists() && realpath.is_file() {
+        return Ok(realpath);
+    } else {
+        if realpath.with_extension("html").exists() {
+            return Ok(realpath.with_extension("html"));
+        } else if (realpath.with_extension("htm").exists()) {
+            return Ok(realpath.with_extension("htm"));
+        } else {
+            error!("File not found: {:?}", realpath);
+            return Err(io::Error::new(io::ErrorKind::NotFound, "File not found."));
+        }
+    }
+}
+
+fn is_dev() -> bool {
+    cfg!(debug_assertions)
 }
 async fn error_text(main_text: String, err: &str) -> String {
     // if we are running in dev include the actual error
-    #[cfg(debug_assertions)]
-    let result = main_text + ": " + err;
+    if is_dev() {
+        main_text + ": " + err
+    }
     // otherwise don't
-    #[cfg(not(debug_assertions))]
-    let result = main_text;
-    result
+    else {
+        main_text
+    }
 }
 async fn respond(
     request: Request<impl hyper::body::Body>,
@@ -53,6 +79,7 @@ async fn respond(
         Err(e) => {
             // If we can't determine the current directory, fail safely
             let error = error_text("Internal server error".to_string(), &e.to_string()).await;
+            error!("{} in getting current dir", error);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::from(error)))
@@ -67,40 +94,61 @@ async fn respond(
 
         Err(e) => {
             let error = error_text("Internal server error".to_string(), &e.to_string()).await;
+            error!("{} in getting canonical base dir", error);
+            debug!("Base directory attempted: {:?}", base_dir);
             return Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::from(error)))
                 .unwrap());
         }
     };
-
-    match canonical_base_dir.join(path).canonicalize() {
+    let foundpath = match files_search(canonical_base_dir.join(path)).await {
+        Ok(fp) => fp,
+        Err(e) => {
+            let error = error_text("File not found".to_string(), &e.to_string()).await;
+            error!("{} in searching for file", error);
+            debug!(
+                "Requested path: {}",
+                canonical_base_dir.join(path).display()
+            );
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap());
+        }
+    };
+    let cannon = match foundpath.canonicalize() {
         Ok(canonical_path) => {
             // Ensure the canonical path is within the canonical base directory
             if !canonical_path.starts_with(&canonical_base_dir) {
+                warn!("Attempted directory traversal attack: {}", requested_path);
                 return Ok(Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .body(Full::new(Bytes::from("Access denied")))
                     .unwrap());
             }
+            canonical_path
         }
 
         Err(e) => {
             // Canonicalization can fail for various reasons (file not found, permission issues, etc.)
             // give generic message for security
-            let error = error_text("Accessed denied".to_string(), &e.to_string()).await;
-            eprintln!("{}", error);
+            let error = error_text("Access denied".to_string(), &e.to_string()).await;
+            error!("{} in getting canonical path", error);
+            debug!("Requested path: {}", requested_path);
+            debug!("Base directory: {:?}", canonical_base_dir);
+            debug!("Full path attempted: {:?}", canonical_base_dir.join(path));
             return Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(error)))
                 .unwrap());
         }
-    }
+    };
+    // handle post requests
 
     // Handle file reading with proper error handling
 
-    let temp = args.serve_path + "/" + requested_path;
-    let getpath = Path::new(&temp);
+    let getpath = cannon.as_path();
     match get_file_bytes(getpath).await {
         Ok(content) => {
             let mut resp = Response::new(Full::new(Bytes::from(content)));
@@ -127,16 +175,27 @@ async fn respond(
                     "map" => "application/json; charset=utf-8",
                     _ => "application/octet-stream",
                 },
-                None => "text/html; charset=utf-8",
+                None => "application/octet-stream",
             };
             let _ = resp.headers_mut().try_append(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_str(mime).unwrap(),
             );
+            // cache content
+            let _ = resp.headers_mut().try_append(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_str("public, max-age=3600").unwrap(),
+            );
+            // standard headers
+            let _ = resp.headers_mut().try_append(
+                header::SERVER,
+                header::HeaderValue::from_str("Simple-Rust-Server/0.1").unwrap(),
+            );
             Ok(resp)
         }
         Err(e) => {
-            eprintln!("{}", e);
+            error!("{}", e);
+            debug!("Error reading file at {:?}", foundpath);
             let error = error_text("File not found".to_string(), &e.to_string()).await;
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -148,8 +207,13 @@ async fn respond(
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    pretty_env_logger::init();
-
+    let mut level = LevelFilter::Warn;
+    if is_dev() {
+        level = LevelFilter::Debug;
+    }
+    pretty_env_logger::formatted_builder()
+        .filter_level(level)
+        .init();
     // This address is localhost
     let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
 
@@ -181,7 +245,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .serve_connection(io, service_fn(respond))
                 .await
             {
-                println!("Error serving connection: {:?}", err);
+                error!("Error serving connection: {:?}", err);
             }
         });
     }
