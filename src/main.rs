@@ -37,7 +37,7 @@ async fn files_search(path: PathBuf) -> Result<PathBuf, io::Error> {
     } else {
         if realpath.with_extension("html").exists() {
             return Ok(realpath.with_extension("html"));
-        } else if (realpath.with_extension("htm").exists()) {
+        } else if realpath.with_extension("htm").exists() {
             return Ok(realpath.with_extension("htm"));
         } else {
             error!("File not found: {:?}", realpath);
@@ -59,20 +59,16 @@ async fn error_text(main_text: String, err: &str) -> String {
         main_text
     }
 }
-async fn respond(
-    request: Request<impl hyper::body::Body>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn resolve_path(
+    mut requested_path: &str,
+) -> Result<(PathBuf), Result<Response<Full<Bytes>>, Infallible>> {
     let args = Args::parse();
-    let mut requested_path = request.uri().path().trim_start_matches('/');
-    // Handle empty path (default to index.html)
+
     if requested_path.is_empty() {
         requested_path = "index.html";
     }
-
-    // Validate path to prevent directory traversal attacks
     let p = requested_path;
     let path = Path::new(p);
-
     let step_dir = match std::env::current_dir() {
         Ok(dir) => dir,
 
@@ -80,27 +76,16 @@ async fn respond(
             // If we can't determine the current directory, fail safely
             let error = error_text("Internal server error".to_string(), &e.to_string()).await;
             error!("{} in getting current dir", error);
-            return Ok(Response::builder()
+            return Err(Ok(Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::from(error)))
-                .unwrap());
+                .unwrap()));
         }
     };
     let base_dir = step_dir.join(args.serve_path.clone());
-
-    // Canonicalize the base directory to handle symlinks and relative paths
-    let canonical_base_dir = match base_dir.canonicalize() {
-        Ok(dir) => dir,
-
-        Err(e) => {
-            let error = error_text("Internal server error".to_string(), &e.to_string()).await;
-            error!("{} in getting canonical base dir", error);
-            debug!("Base directory attempted: {:?}", base_dir);
-            return Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from(error)))
-                .unwrap());
-        }
+    let canonical_base_dir = match canonicalise_base_dir(base_dir).await {
+        Ok(value) => value,
+        Err(value) => return Err(value),
     };
     let foundpath = match files_search(canonical_base_dir.join(path)).await {
         Ok(fp) => fp,
@@ -111,21 +96,21 @@ async fn respond(
                 "Requested path: {}",
                 canonical_base_dir.join(path).display()
             );
-            return Ok(Response::builder()
+            return Err(Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from(error)))
-                .unwrap());
+                .unwrap()));
         }
     };
-    let cannon = match foundpath.canonicalize() {
+    let _ = match foundpath.canonicalize() {
         Ok(canonical_path) => {
             // Ensure the canonical path is within the canonical base directory
             if !canonical_path.starts_with(&canonical_base_dir) {
                 warn!("Attempted directory traversal attack: {}", requested_path);
-                return Ok(Response::builder()
+                return Err(Ok(Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .body(Full::new(Bytes::from("Access denied")))
-                    .unwrap());
+                    .unwrap()));
             }
             canonical_path
         }
@@ -138,17 +123,43 @@ async fn respond(
             debug!("Requested path: {}", requested_path);
             debug!("Base directory: {:?}", canonical_base_dir);
             debug!("Full path attempted: {:?}", canonical_base_dir.join(path));
-            return Ok(Response::builder()
+            return Err(Ok(Response::builder()
                 .status(StatusCode::FORBIDDEN)
                 .body(Full::new(Bytes::from(error)))
-                .unwrap());
+                .unwrap()));
         }
     };
-    // handle post requests
+    Ok(foundpath)
+}
 
-    // Handle file reading with proper error handling
+async fn canonicalise_base_dir(
+    base_dir: PathBuf,
+) -> Result<PathBuf, Result<Response<Full<Bytes>>, Infallible>> {
+    let canonical_base_dir = match base_dir.canonicalize() {
+        Ok(dir) => dir,
 
-    let getpath = cannon.as_path();
+        Err(e) => {
+            let error = error_text("Internal server error".to_string(), &e.to_string()).await;
+            error!("{} in getting canonical base dir", error);
+            debug!("Base directory attempted: {:?}", base_dir);
+            return Err(Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap()));
+        }
+    };
+    Ok(canonical_base_dir)
+}
+async fn respond(
+    request: Request<impl hyper::body::Body>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let requested_path = request.uri().path().trim_start_matches('/');
+    // Handle empty path (default to index.html)
+    let foundpath = match resolve_path(requested_path).await {
+        Ok(value) => value,
+        Err(value) => return value,
+    };
+    let getpath = foundpath.as_path();
     match get_file_bytes(getpath).await {
         Ok(content) => {
             let mut resp = Response::new(Full::new(Bytes::from(content)));
