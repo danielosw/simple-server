@@ -30,7 +30,7 @@ struct Args {
 async fn get_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path).await
 }
-async fn files_search(path: PathBuf) -> Result<PathBuf, io::Error> {
+async fn find_file_alt(path: PathBuf) -> Result<PathBuf, io::Error> {
     let realpath = path;
     if realpath.exists() && realpath.is_file() {
         return Ok(realpath);
@@ -59,9 +59,72 @@ async fn error_text(main_text: String, err: &str) -> String {
         main_text
     }
 }
+async fn canonicalise_path_or_err(
+    path: PathBuf,
+    error_message: &str,
+
+    failure_status: StatusCode,
+) -> Result<PathBuf, Result<Response<Full<Bytes>>, Infallible>> {
+    let _ = match path.canonicalize() {
+        Ok(dir) => return Ok(dir),
+
+        Err(e) => {
+            let error = error_text(error_message.to_string(), &e.to_string()).await;
+            error!("Canonicalization failed: {}", error);
+            debug!("attempted to canonicaize: {:?}", path);
+            return Err(Ok(Response::builder()
+                .status(failure_status)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap()));
+        }
+    };
+}
+fn generate_response(
+    extension: Option<String>,
+    content: Vec<u8>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let mut resp = Response::new(Full::new(Bytes::from(content)));
+    // Set Content-Type based on file extension
+    let mime = match extension {
+        Some(ext) => match (&ext).as_str() {
+            "html" | "htm" | "" => "text/html; charset=utf-8",
+            "css" => "text/css; charset=utf-8",
+            "js" => "text/javascript; charset=utf-8",
+            "mjs" => "text/javascript; charset=utf-8",
+            "json" => "application/json; charset=utf-8",
+            "svg" => "image/svg+xml",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "ico" => "image/x-icon",
+            "txt" | "log" => "text/plain; charset=utf-8",
+            "wasm" => "application/wasm",
+            "map" => "application/json; charset=utf-8",
+            _ => "application/octet-stream",
+        },
+        None => "application/octet-stream",
+    };
+    let _ = resp.headers_mut().try_append(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_str(mime).unwrap(),
+    );
+    // cache content
+    let _ = resp.headers_mut().try_append(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_str("public, max-age=3600").unwrap(),
+    );
+    // standard headers
+    let _ = resp.headers_mut().try_append(
+        header::SERVER,
+        header::HeaderValue::from_str("Simple-Rust-Server/0.1").unwrap(),
+    );
+    Ok(resp)
+}
+
 async fn resolve_path(
     mut requested_path: &str,
-) -> Result<(PathBuf), Result<Response<Full<Bytes>>, Infallible>> {
+) -> Result<PathBuf, Result<Response<Full<Bytes>>, Infallible>> {
     let args = Args::parse();
 
     if requested_path.is_empty() {
@@ -83,11 +146,17 @@ async fn resolve_path(
         }
     };
     let base_dir = step_dir.join(args.serve_path.clone());
-    let canonical_base_dir = match canonicalise_base_dir(base_dir).await {
+    let canonical_base_dir = match canonicalise_path_or_err(
+        base_dir,
+        "Internal server error",
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await
+    {
         Ok(value) => value,
         Err(value) => return Err(value),
     };
-    let foundpath = match files_search(canonical_base_dir.join(path)).await {
+    let foundpath = match find_file_alt(canonical_base_dir.join(path)).await {
         Ok(fp) => fp,
         Err(e) => {
             let error = error_text("File not found".to_string(), &e.to_string()).await;
@@ -102,108 +171,56 @@ async fn resolve_path(
                 .unwrap()));
         }
     };
-    let _ = match foundpath.canonicalize() {
-        Ok(canonical_path) => {
-            // Ensure the canonical path is within the canonical base directory
-            if !canonical_path.starts_with(&canonical_base_dir) {
-                warn!("Attempted directory traversal attack: {}", requested_path);
-                return Err(Ok(Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .body(Full::new(Bytes::from("Access denied")))
-                    .unwrap()));
-            }
-            canonical_path
-        }
 
-        Err(e) => {
-            // Canonicalization can fail for various reasons (file not found, permission issues, etc.)
-            // give generic message for security
-            let error = error_text("Access denied".to_string(), &e.to_string()).await;
-            error!("{} in getting canonical path", error);
-            debug!("Requested path: {}", requested_path);
-            debug!("Base directory: {:?}", canonical_base_dir);
-            debug!("Full path attempted: {:?}", canonical_base_dir.join(path));
-            return Err(Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Full::new(Bytes::from(error)))
-                .unwrap()));
-        }
-    };
+    let _ =
+        match canonicalise_path_or_err(foundpath.clone(), "Access denied", StatusCode::FORBIDDEN)
+            .await
+        {
+            Ok(canonical_path) => {
+                // Ensure the canonical path is within the canonical base directory
+                if !canonical_path.starts_with(&canonical_base_dir) {
+                    warn!("Attempted directory traversal attack: {}", requested_path);
+                    return Err(Ok(Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(Full::new(Bytes::from("Access denied")))
+                        .unwrap()));
+                }
+                canonical_path
+            }
+
+            Err(e) => {
+                debug!("Requested path: {}", requested_path);
+                debug!("Base directory: {:?}", canonical_base_dir);
+                debug!("Full path attempted: {:?}", canonical_base_dir.join(path));
+
+                return Err(e);
+                // Canonicalization can fail for various reasons (file not found, permission issues, etc.)
+                // give generic message for security
+            }
+        };
     Ok(foundpath)
 }
-
-async fn canonicalise_base_dir(
-    base_dir: PathBuf,
-) -> Result<PathBuf, Result<Response<Full<Bytes>>, Infallible>> {
-    let canonical_base_dir = match base_dir.canonicalize() {
-        Ok(dir) => dir,
-
-        Err(e) => {
-            let error = error_text("Internal server error".to_string(), &e.to_string()).await;
-            error!("{} in getting canonical base dir", error);
-            debug!("Base directory attempted: {:?}", base_dir);
-            return Err(Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from(error)))
-                .unwrap()));
-        }
-    };
-    Ok(canonical_base_dir)
-}
-async fn respond(
+async fn handle_get(
     request: Request<impl hyper::body::Body>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let requested_path = request.uri().path().trim_start_matches('/');
-    // Handle empty path (default to index.html)
-    let foundpath = match resolve_path(requested_path).await {
+    let mut requested_path = request.uri().path().trim_start_matches('/');
+
+    if requested_path.is_empty() {
+        requested_path = "index.html";
+    }
+    let foundpath: PathBuf = match resolve_path(requested_path).await {
         Ok(value) => value,
         Err(value) => return value,
     };
     let getpath = foundpath.as_path();
     match get_file_bytes(getpath).await {
-        Ok(content) => {
-            let mut resp = Response::new(Full::new(Bytes::from(content)));
-            // Set Content-Type based on file extension
-            let mime = match getpath
+        Ok(content) => generate_response(
+            getpath
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|s| s.to_lowercase())
-            {
-                Some(ext) => match ext.as_str() {
-                    "html" | "htm" | "" => "text/html; charset=utf-8",
-                    "css" => "text/css; charset=utf-8",
-                    "js" => "text/javascript; charset=utf-8",
-                    "mjs" => "text/javascript; charset=utf-8",
-                    "json" => "application/json; charset=utf-8",
-                    "svg" => "image/svg+xml",
-                    "png" => "image/png",
-                    "jpg" | "jpeg" => "image/jpeg",
-                    "gif" => "image/gif",
-                    "webp" => "image/webp",
-                    "ico" => "image/x-icon",
-                    "txt" | "log" => "text/plain; charset=utf-8",
-                    "wasm" => "application/wasm",
-                    "map" => "application/json; charset=utf-8",
-                    _ => "application/octet-stream",
-                },
-                None => "application/octet-stream",
-            };
-            let _ = resp.headers_mut().try_append(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_str(mime).unwrap(),
-            );
-            // cache content
-            let _ = resp.headers_mut().try_append(
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_str("public, max-age=3600").unwrap(),
-            );
-            // standard headers
-            let _ = resp.headers_mut().try_append(
-                header::SERVER,
-                header::HeaderValue::from_str("Simple-Rust-Server/0.1").unwrap(),
-            );
-            Ok(resp)
-        }
+                .map(|s| s.to_lowercase()),
+            content,
+        ),
         Err(e) => {
             error!("{}", e);
             debug!("Error reading file at {:?}", foundpath);
@@ -212,6 +229,38 @@ async fn respond(
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from(error)))
                 .unwrap())
+        }
+    }
+}
+async fn handle_post(
+    _request: Request<impl hyper::body::Body>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let error = error_text(
+        "Method not allowed".to_string(),
+        "Only GET method is supported",
+    )
+    .await;
+    Ok(Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .body(Full::new(Bytes::from(error)))
+        .unwrap())
+}
+async fn respond(
+    request: Request<impl hyper::body::Body>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    match request.method() {
+        &hyper::Method::GET => return handle_get(request).await,
+        &hyper::Method::POST => return handle_post(request).await,
+        _ => {
+            let error = error_text(
+                "Method not allowed".to_string(),
+                "Only GET or POST method is supported",
+            )
+            .await;
+            return Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(Full::new(Bytes::from(error)))
+                .unwrap());
         }
     }
 }
