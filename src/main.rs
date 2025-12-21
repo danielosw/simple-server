@@ -79,7 +79,7 @@ async fn canonicalise_path_or_err(
         }
     };
 }
-fn generate_response(
+async fn generate_response(
     extension: Option<String>,
     content: Vec<u8>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -214,13 +214,16 @@ async fn handle_get(
     };
     let getpath = foundpath.as_path();
     match get_file_bytes(getpath).await {
-        Ok(content) => generate_response(
-            getpath
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_lowercase()),
-            content,
-        ),
+        Ok(content) => {
+            generate_response(
+                getpath
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_lowercase()),
+                content,
+            )
+            .await
+        }
         Err(e) => {
             error!("{}", e);
             debug!("Error reading file at {:?}", foundpath);
